@@ -1,0 +1,5 @@
+/build*/
+/mdk-sdk/
+/.mdk-download/
+/core/target/
+/tools/out/

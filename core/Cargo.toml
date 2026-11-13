@@ -1,0 +1,21 @@
+[package]
+name = "mdk-crm-core"
+version = "0.1.0"
+edition = "2024"
+authors = ["Adrian <adrian.eddy at gmail>"]
+description = "Canon Cinema RAW Light (.CRM) decode core of the MDK CRM plugin"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+canon-raw = { git = "https://github.com/AdrianEddy/canon-raw" }
+crm-container = { git = "https://github.com/AdrianEddy/canon-raw" }
+libloading = "0.9"
+pollster = "0.4"
+
+[profile.release]
+debug = 1
+panic = "unwind"
