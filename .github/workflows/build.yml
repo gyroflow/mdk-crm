@@ -31,7 +31,8 @@ jobs:
         if: matrix.sdk == 'linux'
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends ca-certificates curl gnupg git xz-utils p7zip-full ninja-build make binutils
+          # gcc: the C linker of Rust's build scripts
+          apt-get install -y --no-install-recommends ca-certificates curl gnupg git xz-utils p7zip-full ninja-build make binutils gcc libc6-dev
           curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor > /usr/share/keyrings/llvm.gpg
           # The newest LLVM apt.llvm.org still builds for buster.
           echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] http://apt.llvm.org/buster/ llvm-toolchain-buster-20 main" > /etc/apt/sources.list.d/llvm.list
@@ -59,21 +60,26 @@ jobs:
         shell: bash
         run: bash scripts/fetch-mdk-sdk.sh ${{ matrix.sdk }} ${{ env.MDK_CHANNEL }}
 
-      - name: Configure
+      # Not in bash on Windows: Git's /usr/bin/link would stand in for MSVC's link.exe.
+      # clang-cl: MSVC rejects a constexpr in MDK's headers; libmdk itself is built with clang-cl.
+      - name: Build (Windows)
+        if: matrix.sdk == 'windows'
+        shell: cmd
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl || exit /b 1
+          cmake --build build || exit /b 1
+
+      - name: Build
+        if: matrix.sdk != 'windows'
         shell: bash
         run: |
           args=(-G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo)
           case "${{ matrix.sdk }}" in
-            # MSVC rejects a constexpr in MDK's headers; libmdk itself is built with clang-cl.
-            windows) args+=(-DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl) ;;
             macos) args+=("-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0) ;;
             linux) args+=(-DCMAKE_C_COMPILER=clang-20 -DCMAKE_CXX_COMPILER=clang++-20) ;;
           esac
           cmake -S . -B build "${args[@]}"
-
-      - name: Build
-        shell: bash
-        run: cmake --build build
+          cmake --build build
 
       - name: Check the glibc floor
         if: matrix.sdk == 'linux'
