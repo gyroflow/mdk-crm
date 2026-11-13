@@ -9,10 +9,7 @@ on:
         description: "MDK SDK channel to build against (nightly or release)"
         default: nightly
 
-# canon-raw is private until it is published: a token with read access to it,
-# in the CANON_RAW_TOKEN secret, lets cargo fetch the git dependency.
 env:
-  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
   MDK_CHANNEL: ${{ inputs.mdk || 'nightly' }}
 
 jobs:
@@ -36,9 +33,10 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends ca-certificates curl gnupg git xz-utils p7zip-full ninja-build make binutils
           curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor > /usr/share/keyrings/llvm.gpg
-          echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] http://apt.llvm.org/buster/ llvm-toolchain-buster-21 main" > /etc/apt/sources.list.d/llvm.list
+          # The newest LLVM apt.llvm.org still builds for buster.
+          echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] http://apt.llvm.org/buster/ llvm-toolchain-buster-20 main" > /etc/apt/sources.list.d/llvm.list
           apt-get update
-          apt-get install -y --no-install-recommends clang-21 lld-21 libc++-21-dev libc++abi-21-dev
+          apt-get install -y --no-install-recommends clang-20 libc++-20-dev libc++abi-20-dev
           curl -fsSL https://github.com/Kitware/CMake/releases/download/v3.31.6/cmake-3.31.6-linux-x86_64.tar.gz | tar xz -C /opt
           echo "/opt/cmake-3.31.6-linux-x86_64/bin" >> $GITHUB_PATH
           curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
@@ -57,13 +55,6 @@ jobs:
         with:
           arch: x64
 
-      - name: Access to canon-raw
-        shell: bash
-        run: |
-          if [ -n "${{ secrets.CANON_RAW_TOKEN }}" ]; then
-            git config --global url."https://x-access-token:${{ secrets.CANON_RAW_TOKEN }}@github.com/AdrianEddy/canon-raw".insteadOf "https://github.com/AdrianEddy/canon-raw"
-          fi
-
       - name: MDK SDK
         shell: bash
         run: bash scripts/fetch-mdk-sdk.sh ${{ matrix.sdk }} ${{ env.MDK_CHANNEL }}
@@ -76,7 +67,7 @@ jobs:
             # MSVC rejects a constexpr in MDK's headers; libmdk itself is built with clang-cl.
             windows) args+=(-DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl) ;;
             macos) args+=("-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0) ;;
-            linux) args+=(-DCMAKE_C_COMPILER=clang-21 -DCMAKE_CXX_COMPILER=clang++-21) ;;
+            linux) args+=(-DCMAKE_C_COMPILER=clang-20 -DCMAKE_CXX_COMPILER=clang++-20) ;;
           esac
           cmake -S . -B build "${args[@]}"
 
