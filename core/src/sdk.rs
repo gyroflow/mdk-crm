@@ -300,7 +300,8 @@ fn apply_luts(lib: &CrmSdkLibrary, lib_path: &Path, explicit: Option<&Path>) {
             }
             Some(d.to_path_buf())
         }
-        None => lib_path.ancestors().skip(1).take(5).find(|d| d.join(LUTS).is_dir()).map(Path::to_path_buf),
+        // Up to the SDK root, from as deep as Mac_Lib/x86_64/CrmSdk.framework/Versions/A/CrmSdk.
+        None => lib_path.ancestors().skip(1).take(8).find(|d| d.join(LUTS).is_dir()).map(Path::to_path_buf),
     };
     if let Some(dir) = dir {
         if let Err(e) = lib.set_luts_directory(&dir, true) {

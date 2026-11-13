@@ -1,6 +1,7 @@
 /*
  * Play a clip through the plugin with MDK's Player, rendering into an
- * offscreen D3D11 texture the way an application does.
+ * offscreen texture the way an application does: D3D11 on Windows, Metal on
+ * macOS.
  *
  *   crm_render <clip> [-d "CRM:opt=val:..."] [-w width] [-h height] [-s seek_ms] [-p play_seconds] [-o out.ppm]
  *
@@ -8,7 +9,11 @@
  * and reports how many distinct frames were presented.
  * SPDX-License-Identifier: MIT OR Apache-2.0
  */
+#if defined(_WIN32)
 #include <d3d11.h> // before RenderAPI.h, which declares D3D11RenderAPI only after it
+#elif defined(__APPLE__)
+#import <Metal/Metal.h>
+#endif
 #include "mdk/Player.h"
 #include "mdk/RenderAPI.h"
 #include <atomic>
@@ -24,6 +29,28 @@ using namespace MDK_NS;
 using namespace std;
 using clk = chrono::steady_clock;
 
+// RGBA8 rows to a PPM.
+static bool write_ppm(const char* path, unsigned w, unsigned h, const uint8_t* data, size_t pitch)
+{
+    FILE* fp = fopen(path, "wb");
+    if (!fp)
+        return false;
+    fprintf(fp, "P6\n%u %u\n255\n", w, h);
+    string row(w * 3, '\0');
+    for (unsigned y = 0; y < h; ++y) {
+        const auto src = data + (size_t)y * pitch;
+        for (unsigned x = 0; x < w; ++x) {
+            row[x * 3 + 0] = (char)src[x * 4 + 0];
+            row[x * 3 + 1] = (char)src[x * 4 + 1];
+            row[x * 3 + 2] = (char)src[x * 4 + 2];
+        }
+        fwrite(row.data(), 1, row.size(), fp);
+    }
+    fclose(fp);
+    return true;
+}
+
+#if defined(_WIN32)
 template<typename T>
 struct Com {
     T* p = nullptr;
@@ -33,39 +60,85 @@ struct Com {
     operator T*() const { return p; }
 };
 
-static bool save(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11Texture2D* tex, const char* path)
-{
-    D3D11_TEXTURE2D_DESC d{};
-    tex->GetDesc(&d);
-    d.Usage = D3D11_USAGE_STAGING;
-    d.BindFlags = 0;
-    d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    d.MiscFlags = 0;
-    Com<ID3D11Texture2D> staging;
-    if (FAILED(dev->CreateTexture2D(&d, nullptr, &staging)))
-        return false;
-    ctx->CopyResource(staging, tex);
-    D3D11_MAPPED_SUBRESOURCE m{};
-    if (FAILED(ctx->Map(staging, 0, D3D11_MAP_READ, 0, &m)))
-        return false;
-    FILE* fp = fopen(path, "wb");
-    if (fp) {
-        fprintf(fp, "P6\n%u %u\n255\n", d.Width, d.Height);
-        string row(d.Width * 3, '\0');
-        for (UINT y = 0; y < d.Height; ++y) {
-            const auto src = (const uint8_t*)m.pData + (size_t)y * m.RowPitch;
-            for (UINT x = 0; x < d.Width; ++x) {
-                row[x * 3 + 0] = (char)src[x * 4 + 0];
-                row[x * 3 + 1] = (char)src[x * 4 + 1];
-                row[x * 3 + 2] = (char)src[x * 4 + 2];
-            }
-            fwrite(row.data(), 1, row.size(), fp);
-        }
-        fclose(fp);
+// An RGBA8 render target texture.
+struct Target {
+    Com<ID3D11Device> dev;
+    Com<ID3D11DeviceContext> ctx;
+    Com<ID3D11Texture2D> tex;
+    D3D11RenderAPI ra;
+
+    bool create(int width, int height) {
+        if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0,
+                                     D3D11_SDK_VERSION, &dev, nullptr, &ctx)))
+            return false;
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = width;
+        td.Height = height;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(dev->CreateTexture2D(&td, nullptr, &tex)))
+            return false;
+        ra = D3D11RenderAPI(ctx, tex);
+        return true;
     }
-    ctx->Unmap(staging, 0);
-    return fp != nullptr;
-}
+    const RenderAPI* api() const { return &ra; }
+    bool save(const char* path) {
+        D3D11_TEXTURE2D_DESC d{};
+        tex->GetDesc(&d);
+        d.Usage = D3D11_USAGE_STAGING;
+        d.BindFlags = 0;
+        d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        d.MiscFlags = 0;
+        Com<ID3D11Texture2D> staging;
+        if (FAILED(dev->CreateTexture2D(&d, nullptr, &staging)))
+            return false;
+        ctx->CopyResource(staging, tex);
+        D3D11_MAPPED_SUBRESOURCE m{};
+        if (FAILED(ctx->Map(staging, 0, D3D11_MAP_READ, 0, &m)))
+            return false;
+        const bool ok = write_ppm(path, d.Width, d.Height, (const uint8_t*)m.pData, m.RowPitch);
+        ctx->Unmap(staging, 0);
+        return ok;
+    }
+};
+#elif defined(__APPLE__)
+struct Target {
+    id<MTLDevice> dev = nil;
+    id<MTLCommandQueue> queue = nil;
+    id<MTLTexture> tex = nil;
+    MetalRenderAPI ra;
+
+    bool create(int width, int height) {
+        dev = MTLCreateSystemDefaultDevice();
+        queue = [dev newCommandQueue];
+        auto desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:width height:height mipmapped:NO];
+        desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        desc.storageMode = MTLStorageModePrivate;
+        tex = [dev newTextureWithDescriptor:desc];
+        ra.device = (__bridge const void*)dev;
+        ra.cmdQueue = (__bridge const void*)queue;
+        ra.texture = (__bridge const void*)tex;
+        return dev && queue && tex;
+    }
+    const RenderAPI* api() const { return &ra; }
+    bool save(const char* path) {
+        const auto w = tex.width, h = tex.height, pitch = w * 4;
+        id<MTLBuffer> buf = [dev newBufferWithLength:pitch * h options:MTLResourceStorageModeShared];
+        id<MTLCommandBuffer> cb = [queue commandBuffer]; // after MDK's work on the same queue
+        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        [blit copyFromTexture:tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
+                     toBuffer:buf destinationOffset:0 destinationBytesPerRow:pitch destinationBytesPerImage:pitch * h];
+        [blit endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        return write_ppm(path, (unsigned)w, (unsigned)h, (const uint8_t*)buf.contents, pitch);
+    }
+};
+#endif
 
 int main(int argc, char** argv)
 {
@@ -92,25 +165,9 @@ int main(int argc, char** argv)
     setLogHandler([](LogLevel, const char* msg) { fputs(msg, stderr); });
     SetGlobalOption("plugins", "mdk-crm");
 
-    Com<ID3D11Device> dev;
-    Com<ID3D11DeviceContext> ctx;
-    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0,
-                                 D3D11_SDK_VERSION, &dev, nullptr, &ctx))) {
-        printf("FAILED: no D3D11 device\n");
-        return 1;
-    }
-    D3D11_TEXTURE2D_DESC td{};
-    td.Width = width;
-    td.Height = height;
-    td.MipLevels = 1;
-    td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    td.SampleDesc.Count = 1;
-    td.Usage = D3D11_USAGE_DEFAULT;
-    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-    Com<ID3D11Texture2D> tex;
-    if (FAILED(dev->CreateTexture2D(&td, nullptr, &tex))) {
-        printf("FAILED: render target\n");
+    Target target;
+    if (!target.create(width, height)) {
+        printf("FAILED: no render target\n");
         return 1;
     }
 
@@ -120,8 +177,7 @@ int main(int argc, char** argv)
         p.setDecoders(MediaType::Audio, {});
     p.setMute(true);
     p.setMedia(url.c_str());
-    D3D11RenderAPI ra(ctx, tex);
-    p.setRenderAPI(&ra);
+    p.setRenderAPI(target.api());
     p.setVideoSurfaceSize(width, height);
     p.setBackgroundColor(1, 0, 1, 1); // magenta shows anything left unrendered
 
@@ -155,7 +211,7 @@ int main(int argc, char** argv)
     }
     printf("first frame rendered after %.0f ms, t=%.4f\n", chrono::duration<double, milli>(clk::now() - t0).count(), ts);
     if (!out.empty())
-        printf("%s %s\n", save(dev, ctx, tex, out.c_str()) ? "wrote" : "FAILED writing", out.c_str());
+        printf("%s %s\n", target.save(out.c_str()) ? "wrote" : "FAILED writing", out.c_str());
 
     // Frame sizes as they reach the renderer.
     atomic<int> lastW = 0, lastH = 0;
