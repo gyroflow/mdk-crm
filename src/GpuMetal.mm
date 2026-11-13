@@ -62,7 +62,7 @@ public:
         } else {
             int i = 0;
             for (id<MTLDevice> d in MTLCopyAllDevices()) {
-                if (device == std::to_string(i++) || strstr(d.name.UTF8String, device.c_str())) {
+                if (GpuMatches(device, i++, d.name.UTF8String)) {
                     dev_ = d;
                     break;
                 }

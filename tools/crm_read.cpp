@@ -97,9 +97,7 @@ int main(int argc, char** argv)
             firstTs = v.timestamp();
             w = v.width();
             h = v.height();
-            ostringstream os;
-            os << v.format();
-            fmt = os.str();
+            fmt = v.format().name() ? v.format().name() : "?";
             if (v.duration() > 0)
                 dt = v.duration();
         } else if (dt > 0 && fabs(v.timestamp() - lastTs - dt) > dt / 2) {
@@ -121,7 +119,13 @@ int main(int argc, char** argv)
         if (mi) {
             info = *mi;
             opened = true;
-            cout << "opened at " << pos << " ms: " << info << endl;
+            printf("opened at %lld ms: %s, %lld ms", (long long)pos, info.format.c_str(), (long long)info.duration);
+            if (!info.video.empty())
+                printf(", %dx%d @ %.3f fps, %lld frames", info.video[0].codec.width, info.video[0].codec.height,
+                       info.video[0].codec.frame_rate, (long long)info.video[0].frames);
+            printf("\n");
+            for (const auto& [k, v] : info.metadata)
+                printf("  %s: %s\n", k.c_str(), v.c_str());
         } else {
             finish();
         }

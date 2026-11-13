@@ -667,9 +667,6 @@ fn clip_metadata(
     if let Ok(s) = sdk.get_image_info(format_id, hdr, image_info::LensName) {
         v.push(("lens".into(), text(s)));
     }
-    if let Ok(f) = sdk.get_image_info(format_id, hdr, image_info::FocalLength) {
-        v.push(("focal_length".into(), f.to_string()));
-    }
     if let Ok(iso) = sdk.get_image_info(format_id, hdr, image_info::IsoSpeed) {
         v.push(("iso".into(), iso.to_string()));
     }

@@ -103,6 +103,11 @@ pub fn init(search: &[PathBuf], luts_dir: Option<&Path>, gpu: &Gpu) -> Result<()
     // SAFETY: nothing has been created on the SDK: no regime is bound yet.
     let _ = unsafe { lib.terminate_sdk() };
     init_lane(&lib, gpu)?;
+    if let Err(e) = check_supported(&lib, gpu.lane) {
+        // SAFETY: nothing was created on the regime that was just bound.
+        let _ = unsafe { lib.terminate_sdk() };
+        return Err(e);
+    }
     apply_luts(&lib, &path, luts_dir);
     s.key = Some(key);
     Ok(())
@@ -144,6 +149,28 @@ fn init_lane(lib: &CrmSdkLibrary, gpu: &Gpu) -> Result<(), String> {
         let detail = lib.get_last_error_string().unwrap_or_default();
         format!("Canon SDK initialisation on {lane} failed: {e} {detail}").trim_end().to_string()
     })
+}
+
+/// The SDK binds any device it is handed, then refuses to create a process
+/// ref on one it does not support (`DeviceNotSupported`), so every clip would
+/// fail. Its own GPU list says which it supports; refusing the lane here lets
+/// the caller try another.
+fn check_supported(lib: &CrmSdkLibrary, lane: i32) -> Result<(), String> {
+    let device = match lane {
+        LANE_CUDA => canon_raw::Device::Cuda,
+        LANE_OPENCL => canon_raw::Device::OpenCl,
+        _ => canon_raw::Device::Metal,
+    };
+    let Ok(list) = lib.get_gpu_info_list_with_device(device) else { return Ok(()) };
+    let names: Vec<String> = list
+        .iter()
+        .map(|g| format!("{}{}", g.device_name(), if g.is_supported() { "" } else { " (unsupported)" }))
+        .collect();
+    eprintln!("CRM: the Canon SDK sees on {}: {}", lane_name(lane), names.join(", "));
+    if list.is_empty() || list.iter().any(|g| g.is_supported()) {
+        return Ok(());
+    }
+    Err(format!("the Canon SDK does not support {} on {}", names.join(", "), lane_name(lane)))
 }
 
 // ─────────────────────────────────────────────────────────────────────

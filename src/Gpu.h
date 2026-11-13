@@ -38,6 +38,17 @@ public:
                              std::function<void()> recycle) = 0;
 };
 
+// Whether device `index` named `name` is the one `device` asks for: all of them
+// when empty, the index when a number, else a part of the name.
+inline bool GpuMatches(const std::string& device, int index, const char* name)
+{
+    if (device.empty())
+        return true;
+    if (device.find_first_not_of("0123456789") == std::string::npos)
+        return std::to_string(index) == device;
+    return name && std::string(name).find(device) != std::string::npos;
+}
+
 // The lanes this platform has, in the order `gpu=auto` tries them.
 std::vector<int> GpuLanes();
 const char* GpuLaneName(int lane);

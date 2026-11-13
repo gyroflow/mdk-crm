@@ -154,9 +154,16 @@ shared_ptr<Gpu> engine(int lane, const string& device, string* err)
     const auto luts = option("CRMSDK_LUTS_DIR");
     string errs;
     for (int l : lane ? vector<int>{lane} : GpuLanes()) {
-        string e;
-        auto gpu = CreateGpu(l, device, &e);
-        if (gpu) {
+        // Without a device named, every device of the lane in turn: the SDK
+        // supports some GPUs and refuses others.
+        for (int i = 0; i < (device.empty() ? 8 : 1); ++i) {
+            string e;
+            auto gpu = CreateGpu(l, device.empty() ? std::to_string(i) : device, &e);
+            if (!gpu) {
+                if (i == 0)
+                    errs += string(errs.empty() ? "" : "; ") + GpuLaneName(l) + ": " + e;
+                break;
+            }
             const auto desc = gpu->desc();
             char buf[2048] = {};
             if (crmc_sdk_init(pdirs.data(), pdirs.size(), luts.c_str(), &desc, buf, sizeof(buf)) == 0) {
@@ -164,10 +171,9 @@ shared_ptr<Gpu> engine(int lane, const string& device, string* err)
                 g_gpu = gpu;
                 return gpu;
             }
-            e = buf;
             g_refused.push_back(gpu);
+            errs += string(errs.empty() ? "" : "; ") + GpuLaneName(l) + " " + gpu->deviceName() + ": " + buf;
         }
-        errs += string(errs.empty() ? "" : "; ") + GpuLaneName(l) + ": " + e;
     }
     *err = errs;
     return nullptr;

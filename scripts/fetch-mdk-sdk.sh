@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Download the MDK SDK and its C++ ABI headers into ./mdk-sdk.
 #
-#   scripts/fetch-mdk-sdk.sh [windows|linux|macos] [nightly|release]
+#   scripts/fetch-mdk-sdk.sh [windows|linux|macos] [nightly|release] [output dir]
 #
 # A plugin must be built against the same MDK build it is loaded into: on an
 # ABI mismatch libmdk only logs "MAY CRASH!" and loads the plugin anyway.
@@ -34,8 +34,9 @@ case "$channel" in
 esac
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
+dest="${3:-$root/mdk-sdk}"
 work="$root/.mdk-download"
-rm -rf "$work" "$root/mdk-sdk"
+rm -rf "$work" "$dest"
 mkdir -p "$work"
 cd "$work"
 
@@ -56,8 +57,9 @@ extract "$sdk"
 # The ABI archive holds mdk-sdk/include/abi/mdk/*.h, laid over the SDK.
 extract mdk-abi-sdk.7z
 
-mv mdk-sdk "$root/mdk-sdk"
+mkdir -p "$(dirname "$dest")"
+mv mdk-sdk "$dest"
 cd "$root"
 rm -rf "$work"
 
-grep -E "define MDK_(ABI_VERSION|MAJOR|MINOR|MICRO)" mdk-sdk/include/abi/mdk/global.h
+grep -E "define MDK_(ABI_VERSION|MAJOR|MINOR|MICRO)" "$dest/include/abi/mdk/global.h"

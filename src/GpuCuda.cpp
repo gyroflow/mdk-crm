@@ -146,7 +146,7 @@ public:
             if (api_.deviceGet(&d, i) != 0)
                 continue;
             api_.deviceGetName(name, sizeof(name), d);
-            if (device.empty() || device == std::to_string(i) || strstr(name, device.c_str())) {
+            if (GpuMatches(device, i, name)) {
                 ordinal_ = i;
                 dev_ = d;
                 name_ = name;

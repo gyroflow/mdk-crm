@@ -21,6 +21,21 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
 
 find_package(Threads REQUIRED)
 
+# libmdk on Linux is built against libc++, and the plugin interface passes
+# std::string, std::function and friends, so the plugin must use it too.
+# The libc++.so.1 shipped with libmdk is from 2020, and current libc++ headers
+# call functions it lacks (std::__hash_memory, bad_function_call's key
+# function), so libc++ is linked in statically and kept private: the plugin
+# imports nothing from that runtime, and the objects it shares with libmdk have
+# libc++'s stable (v1) layout.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    message(FATAL_ERROR "On Linux build with clang and libc++ (libmdk's C++ library): -DCMAKE_CXX_COMPILER=clang++")
+  endif()
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-stdlib=libc++>)
+  add_link_options(-stdlib=libc++ -static-libstdc++ -Wl,--exclude-libs,ALL)
+endif()
+
 setup_mdk_plugin(${PROJECT_NAME})
 
 target_sources(${PROJECT_NAME} PRIVATE
@@ -52,8 +67,10 @@ else()
   set(CORE_LIB_NAME libmdk_crm_core.a)
 endif()
 
+# Extra cargo arguments, e.g. --offline or --config overrides.
+set(CORE_CARGO_ARGS "" CACHE STRING "extra arguments to cargo build")
 set(CARGO_BUILD ${CMAKE_COMMAND} -E env "CARGO_TARGET_DIR=${CORE_TARGET_DIR}"
-  ${CARGO} build --release --manifest-path "${CORE_DIR}/Cargo.toml")
+  ${CARGO} build --release --manifest-path "${CORE_DIR}/Cargo.toml" ${CORE_CARGO_ARGS})
 
 if(APPLE)
   # One static library per architecture, merged.
@@ -79,6 +96,7 @@ if(APPLE)
     COMMAND ${CMAKE_COMMAND} -E make_directory "${CORE_TARGET_DIR}/universal"
     COMMAND lipo -create ${CORE_PARTS} -output ${CORE_LIB}
     DEPENDS ${CORE_SOURCES}
+    WORKING_DIRECTORY "${CORE_DIR}" # cargo reads .cargo/config.toml from here up
     COMMENT "Building the Rust core (${CORE_ARCHS})"
     USES_TERMINAL VERBATIM)
 else()
@@ -86,6 +104,7 @@ else()
   add_custom_command(OUTPUT ${CORE_LIB}
     COMMAND ${CARGO_BUILD}
     DEPENDS ${CORE_SOURCES}
+    WORKING_DIRECTORY "${CORE_DIR}" # cargo reads .cargo/config.toml from here up
     COMMENT "Building the Rust core"
     USES_TERMINAL VERBATIM)
 endif()

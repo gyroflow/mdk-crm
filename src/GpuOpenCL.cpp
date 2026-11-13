@@ -94,7 +94,7 @@ public:
             for (auto d : devices) {
                 char name[256] = {};
                 api_.getDeviceInfo(d, CL_DEVICE_NAME, sizeof(name) - 1, name, nullptr);
-                if (device.empty() || device == std::to_string(index) || strstr(name, device.c_str())) {
+                if (GpuMatches(device, index, name)) {
                     platform_ = p;
                     device_ = d;
                     name_ = name;

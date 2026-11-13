@@ -1,0 +1,109 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      mdk:
+        description: "MDK SDK channel to build against (nightly or release)"
+        default: nightly
+
+# canon-raw is private until it is published: a token with read access to it,
+# in the CANON_RAW_TOKEN secret, lets cargo fetch the git dependency.
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  MDK_CHANNEL: ${{ inputs.mdk || 'nightly' }}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: windows-x64, os: windows-2025, sdk: windows }
+          - { name: macos-universal, os: macos-15, sdk: macos }
+          # Debian 10 (glibc 2.28), as Gyroflow's Linux releases, so the plugin
+          # loads wherever they do. libmdk itself needs glibc 2.17.
+          - { name: linux-x64, os: ubuntu-latest, sdk: linux, container: "debian/eol:buster" }
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    steps:
+      - name: Linux toolchain
+        if: matrix.sdk == 'linux'
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl gnupg git xz-utils p7zip-full ninja-build make binutils
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor > /usr/share/keyrings/llvm.gpg
+          echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] http://apt.llvm.org/buster/ llvm-toolchain-buster-21 main" > /etc/apt/sources.list.d/llvm.list
+          apt-get update
+          apt-get install -y --no-install-recommends clang-21 lld-21 libc++-21-dev libc++abi-21-dev
+          curl -fsSL https://github.com/Kitware/CMake/releases/download/v3.31.6/cmake-3.31.6-linux-x86_64.tar.gz | tar xz -C /opt
+          echo "/opt/cmake-3.31.6-linux-x86_64/bin" >> $GITHUB_PATH
+          curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - uses: actions/checkout@v4
+
+      - name: macOS tools
+        if: matrix.sdk == 'macos'
+        run: |
+          brew install ninja sevenzip
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: matrix.sdk == 'windows'
+        with:
+          arch: x64
+
+      - name: Access to canon-raw
+        shell: bash
+        run: |
+          if [ -n "${{ secrets.CANON_RAW_TOKEN }}" ]; then
+            git config --global url."https://x-access-token:${{ secrets.CANON_RAW_TOKEN }}@github.com/AdrianEddy/canon-raw".insteadOf "https://github.com/AdrianEddy/canon-raw"
+          fi
+
+      - name: MDK SDK
+        shell: bash
+        run: bash scripts/fetch-mdk-sdk.sh ${{ matrix.sdk }} ${{ env.MDK_CHANNEL }}
+
+      - name: Configure
+        shell: bash
+        run: |
+          args=(-G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo)
+          case "${{ matrix.sdk }}" in
+            # MSVC rejects a constexpr in MDK's headers; libmdk itself is built with clang-cl.
+            windows) args+=(-DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl) ;;
+            macos) args+=("-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0) ;;
+            linux) args+=(-DCMAKE_C_COMPILER=clang-21 -DCMAKE_CXX_COMPILER=clang++-21) ;;
+          esac
+          cmake -S . -B build "${args[@]}"
+
+      - name: Build
+        shell: bash
+        run: cmake --build build
+
+      - name: Check the glibc floor
+        if: matrix.sdk == 'linux'
+        run: |
+          max=$(objdump -T build/libmdk-crm.so | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -1)
+          echo "highest glibc symbol version: $max"
+          [ "$(printf '%s\nGLIBC_2.28\n' "$max" | sort -V | tail -1)" = "GLIBC_2.28" ]
+          if objdump -p build/libmdk-crm.so | grep -q 'NEEDED.*libc++'; then echo "links libc++ dynamically"; exit 1; fi
+
+      - name: Package
+        shell: bash
+        run: |
+          abi=$(grep -oE 'MDK_ABI_VERSION [0-9]+' mdk-sdk/include/abi/mdk/global.h | cut -d' ' -f2)
+          echo "ABI=$abi" >> $GITHUB_ENV
+          mkdir -p dist
+          cp build/*mdk-crm.* dist/ 2>/dev/null || true
+          rm -f dist/*.ilk dist/*.exp dist/*.lib
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          # Load it only into the MDK build with this ABI version.
+          name: mdk-crm-${{ matrix.name }}-mdk-abi-${{ env.ABI }}
+          path: dist/
