@@ -7,6 +7,10 @@ description = "Canon Cinema RAW Light (.CRM) decode core of the MDK CRM plugin"
 license = "MIT OR Apache-2.0"
 publish = false
 
+# Its own workspace: it is built from inside other projects' trees (e.g. Gyroflow's ext/),
+# whose manifests cargo would otherwise take for its workspace root.
+[workspace]
+
 [lib]
 crate-type = ["staticlib"]
 
