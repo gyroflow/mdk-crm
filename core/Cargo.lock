@@ -23,7 +23,7 @@ checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 [[package]]
 name = "canon-raw"
 version = "0.1.0"
-source = "git+https://github.com/AdrianEddy/canon-raw#2186a19bace08fef5a4b5b5d6a942811d2115ff6"
+source = "git+https://github.com/AdrianEddy/canon-raw?rev=1eb3a19#1eb3a197ce756198c423fe9ec4ea1b8183182406"
 dependencies = [
  "atomic-waker",
  "bitflags",
@@ -42,7 +42,7 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 [[package]]
 name = "crm-container"
 version = "0.2.1"
-source = "git+https://github.com/AdrianEddy/canon-raw#2186a19bace08fef5a4b5b5d6a942811d2115ff6"
+source = "git+https://github.com/AdrianEddy/canon-raw?rev=1eb3a19#1eb3a197ce756198c423fe9ec4ea1b8183182406"
 dependencies = [
  "mp4-atom",
 ]
@@ -193,9 +193,9 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pollster"
-version = "0.4.0"
+version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f3a9f18d041e6d0e102a0a46750538147e5e8992d3b4873aaafee2520b00ce3"
+checksum = "bc6355899e1c9462875b6757c79f3caa011a1fdae12bbb1a2e72dd1f234f8336"
 
 [[package]]
 name = "proc-macro2"
