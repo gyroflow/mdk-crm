@@ -32,15 +32,31 @@ typedef struct crmc_gpu {
 } crmc_gpu;
 
 /*
+ * Where the core's diagnostics go: `level` is 1 (error), 2 (warning) or 3
+ * (info). Null, the default: standard error. Called from any thread.
+ */
+typedef void (*crmc_log_fn)(int32_t level, const char* msg);
+void crmc_set_log(crmc_log_fn fn);
+
+/*
+ * Find and load the Canon SDK library, without binding a GPU. `search` lists
+ * directories (or library paths), tried in order: a directory is searched for
+ * the library directly and in the SDK's own layout. Loaded once per process;
+ * a failure is not remembered, so the SDK may be installed later.
+ * Returns 0 on success, otherwise writes a message to `err`.
+ */
+int crmc_sdk_load(const char* const* search, size_t n_search, char* err, size_t err_len);
+
+/*
  * Load and initialise the Canon SDK. It is a process singleton: the first call
  * loads the library and binds `gpu`, later calls with the same lane and handles
  * succeed at once, and a different one is refused.
  *
- * `search` lists directories (or library paths), tried in order: a directory
- * is searched for the library directly and in the SDK's own layout.
- * `luts_dir`, when not null or empty, is the directory that CONTAINS
- * `CanonLUTs`; otherwise one beside the library is used.
- * Returns 0 on success, otherwise writes a message to `err`.
+ * `search` as for crmc_sdk_load. `luts_dir`, when not null or empty, is the
+ * directory that CONTAINS `CanonLUTs`; otherwise the SDK's own places are used.
+ * Returns 0 on success. On failure writes a message to `err` and returns -1
+ * when the SDK was not handed the GPU, or -2 when it was (and refused it): the
+ * SDK may then keep using that GPU's stream or queue, which must stay alive.
  */
 int crmc_sdk_init(const char* const* search, size_t n_search, const char* luts_dir, const crmc_gpu* gpu,
                   char* err, size_t err_len);
@@ -51,6 +67,7 @@ typedef struct crmc_open_params {
     int32_t gamma;        /* CrmGamma value; -1: Rec.709 */
     int32_t color_space;  /* CrmColorSpace value; -1: BT.709 */
     int32_t depth;        /* frames decompressed ahead on the CPU (0..3); 0: one synchronous decode per frame */
+    int32_t resolution;   /* CrmResolution class of the process refs; 0: the smallest that holds the clip */
 } crmc_open_params;
 
 typedef struct crmc_info {
@@ -64,6 +81,7 @@ typedef struct crmc_info {
     int32_t gamma;         /* develop recipe in use */
     int32_t color_space;
     int32_t depth;         /* effective read-ahead; 0 when the synchronous path is used */
+    int32_t resolution;    /* CrmResolution class of the process refs */
 } crmc_info;
 
 /* One output raster: RGBA 16-bit little-endian, `bytes_per_line` apart. */
@@ -90,13 +108,15 @@ void crmc_get_output(const crmc_reader* r, crmc_output* out);
 /* Switch to `level`; waits for work in flight. Returns 0 on success. */
 int crmc_set_level(crmc_reader* r, int32_t level, crmc_output* out, char* err, size_t err_len);
 
-typedef void (*crmc_sync_fn)(void* user);
+/* Returns 0 when the work finished, nonzero when the device reported an error. */
+typedef int32_t (*crmc_sync_fn)(void* user);
 
 /*
  * Decode `frame` into `dst`, a buffer of the lane's device (CUdeviceptr,
  * cl_mem or id<MTLBuffer>) of `dst_size` bytes, then call `sync(user)`, which
  * must wait until the device work on the stream or queue given to
- * crmc_sdk_init has finished. On CUDA both run under the SDK's CUDA exclusion.
+ * crmc_sdk_init has finished; a nonzero result fails the decode. On CUDA both
+ * run under the SDK's CUDA exclusion.
  * With `prefetch` the following frames keep decompressing in the background.
  * Returns 0 on success.
  */

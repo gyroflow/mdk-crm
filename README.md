@@ -42,8 +42,9 @@ environment variable `CRMSDK_DIR` (the library itself, the directory holding it,
 | Linux | `Linux_Lib/*` |
 | macOS | `CrmSdk.framework` (universal), in the app's `Frameworks` |
 
-plus the `CanonLUTs` folder beside the library (or name the directory containing it with
-`CRMSDK_LUTS_DIR`). The LUTs are needed for HDR and colour-space conversions.
+plus the `CanonLUTs` folder beside the library or the framework (or name the directory containing
+it with `CRMSDK_LUTS_DIR`). Every develop recipe needs the LUTs, the default Rec.709 one too: without
+them a clip fails to open with the SDK's "The necessary LUT is not available".
 
 On Windows the library must keep the exact name `CrmSdk.dll`: the SDK aborts the process otherwise.
 
@@ -51,7 +52,7 @@ On Windows the library must keep the exact name `CrmSdk.dll`: the SDK aborts the
 
 | Option | Values | Default |
 |---|---|---|
-| `gpu` | `auto`, `cuda`, `opencl`, `metal` | `auto`: CUDA, then OpenCL; Metal on macOS |
+| `gpu` | `auto`, `cuda`, `opencl`, `metal` (`no` is ignored: the SDK develops on the GPU only) | `auto`: CUDA, then OpenCL; Metal on macOS |
 | `device` | GPU index, or a part of its name | the first GPU the SDK supports |
 | `copy` | `1`: hand MDK host memory instead of GPU memory | `0` |
 | `scale` | `1/2`, `1/4`, `WxH`, `W` | full resolution |
@@ -62,8 +63,13 @@ On Windows the library must keep the exact name `CrmSdk.dll`: the SDK aborts the
 
 `scale=WxH` picks the smallest of full, half and quarter resolution that still covers the picture as
 shown fitted into `WxH`, so `scale=1920x1080` decodes a 6K clip at 3000×1582. The levels are the SDK's
-decode levels, which skip work in the decompression itself. Options can also change while playing,
-through `player.setProperty("video.decoder", "scale=1/4")`.
+decode levels, which skip work in the decompression itself. MDK sets `scale` from the player's video
+surface size too (`setVideoSurfaceSize`): a player with a small surface, such as a processing player
+that reads frames to memory, gets quarter resolution unless its decoder string names a `scale` (a
+`scale` in the decoder string wins when the clip opens).
+
+`scale`, `size` and `copy` also change while playing, through
+`player.setProperty("video.decoder", "scale=1/4")`. The others apply when a clip is opened.
 
 Frames are RGBA, 16 bits per sample. The stream's colour space follows `gamma` and `gamut`; camera log
 curves and Cinema Gamut have no MDK equivalent and are left unspecified.
@@ -79,8 +85,41 @@ curves and Cinema Gamut have no MDK equivalent and are left unspecified.
 - The SDK supports only some GPUs. A lane whose GPUs it does not support is refused at initialisation
   (for example an AMD iGPU through Mesa's rusticl), and `gpu=auto` tries the next one.
 - With CUDA the SDK forbids its calls from overlapping any other CUDA call in the process. The plugin
-  takes the SDK's lock around its own CUDA work and around MDK's mapping of its frames; CUDA work that
-  other parts of the application do outside MDK is not covered.
+  takes the SDK's lock around its own CUDA work and around MDK's creation, mapping and release of its
+  frames. The application's own CUDA work (CUDA interop, FFmpeg decoding or encoding on CUDA, other
+  CUDA libraries) is the application's to wrap, with the two functions the plugin exports (look them
+  up in the loaded plugin, e.g. `GetProcAddress(GetModuleHandleW(L"mdk-crm.dll"), ...)`):
+
+  ```c
+  void mdk_crm_cuda_exclusive(void (*fn)(void* user), void* user); // fn(user) under the lock; reentrant
+  int mdk_crm_cuda_in_use(void);                                   // 1 while the SDK develops on CUDA
+  ```
+
+  Take the lock whenever the plugin is loaded, not only once a clip develops on CUDA, so that work
+  begun earlier cannot overlap the first develops; and hold it around the CUDA calls only, since the
+  plugin cannot develop a frame, nor MDK map one, while it is held.
+
+  Not covered by either: CUDA work MDK does for other media in the same process (its NVDEC decoder,
+  the CUDA pools of other players).
+- Memory per reader: the SDK's process refs, a develop ref on the GPU (about 1 GB of device memory at
+  8K; refs are sized by the clip's RAW frame, 4K, 4.5K, 5.9K or 8K) and a decompress ref in host
+  memory (about 3.5 GB committed with its threads); and the output frames, one buffer each (283 MB at
+  8K full resolution), at most `depth` + 4 per reader (+ 2 on Metal). Process refs are kept for reuse
+  until the process exits: releasing one soon after creating it can crash the SDK on Windows. So a
+  process keeps the refs of the most readers it ever had open at once.
+- A clip cut short (a recording that lost power, an interrupted copy) plays to the last frame whose
+  data is in the file. A frame that fails to develop is skipped. When three in a row fail (a damaged
+  stretch, the GPU out of memory), the stream ends: the reader sends the end of the stream, so that a
+  player or a processing loop waiting for frames is released. A seek into such a stretch shows a
+  black frame at the third frame tried, then ends the stream the same way: MDK takes the end of a
+  stream only after a frame. A clip none of whose first three frames develops fails to open, with
+  the reason (for example missing `CanonLUTs`); the player's media status then turns `Invalid`.
+- With `continue_at_end` and a loop count, MDK does not restart the loop of a stream that has no
+  audio being decoded beside it (a clip without audio tracks, or a player with audio decoders off):
+  the player stays at the end of the clip or of its playback range, playing. Seeks still work there
+  (the end of the stream and the frames at the end of the range are handed to MDK on a thread of
+  their own, since MDK holds on to them), so loop by seeking to the start of the range when the
+  position stops at its end.
 
 ## Building
 
@@ -118,7 +157,8 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo "-DCMAKE_OSX_ARCH
 cmake --build build
 ```
 
-`-DCORE_CARGO_ARGS=...` passes extra arguments to cargo; `-DCORE_TARGET_DIR=...` moves its target dir.
+`-DCORE_CARGO_ARGS=...` replaces the arguments passed to cargo (default `--locked`: the dependencies are
+the ones `core/Cargo.lock` names); `-DCORE_TARGET_DIR=...` moves its target dir.
 
 ## Testing
 

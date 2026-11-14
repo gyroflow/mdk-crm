@@ -49,7 +49,9 @@ else()
   target_sources(${PROJECT_NAME} PRIVATE src/GpuCuda.cpp src/GpuOpenCL.cpp)
 endif()
 target_include_directories(${PROJECT_NAME} PRIVATE src)
-set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME ${PROJECT_NAME})
+# The plugin ships as built: only setup_mdk_plugin's $ORIGIN / @loader_path
+# entries, not the build machine's libmdk directory that CMake would add.
+set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME ${PROJECT_NAME} BUILD_WITH_INSTALL_RPATH ON)
 if(WIN32)
   target_compile_definitions(${PROJECT_NAME} PRIVATE _CRT_SECURE_NO_WARNINGS) # getenv
 endif()
@@ -70,8 +72,9 @@ else()
   set(CORE_LIB_NAME libmdk_crm_core.a)
 endif()
 
-# Extra cargo arguments, e.g. --offline or --config overrides.
-set(CORE_CARGO_ARGS "" CACHE STRING "extra arguments to cargo build")
+# Arguments to cargo build, e.g. --offline. --locked: the dependencies are the
+# ones Cargo.lock names, or the build fails (drop it only for a local [patch]).
+set(CORE_CARGO_ARGS "--locked" CACHE STRING "arguments to cargo build")
 set(CARGO_BUILD ${CMAKE_COMMAND} -E env "CARGO_TARGET_DIR=${CORE_TARGET_DIR}"
   ${CARGO} build --release --manifest-path "${CORE_DIR}/Cargo.toml" ${CORE_CARGO_ARGS})
 

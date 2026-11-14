@@ -38,6 +38,7 @@ use canon_raw::{
 };
 use crm_container::CrmContainer;
 
+use crate::log;
 use crate::sdk::{self, LANE_CUDA, LANE_METAL, LANE_OPENCL};
 
 /// RGBA, 16 bits per sample, little-endian: the only four-channel output the
@@ -70,12 +71,33 @@ pub struct Info {
     pub gamma: i32,
     pub color_space: i32,
     pub depth: i32,
+    /// The process refs' `CrmResolution` class.
+    pub resolution: i32,
 }
 
 pub struct OpenParams {
     pub gamma: Option<Gamma>,
     pub color_space: Option<ColorSpace>,
     pub depth: usize,
+    /// The process refs' class; `None`: the smallest that holds the clip.
+    pub resolution: Option<Resolution>,
+}
+
+pub fn resolution_from(v: i32) -> Option<Resolution> {
+    [Resolution::K4, Resolution::K4_5, Resolution::K5_9, Resolution::K8].into_iter().find(|r| *r as i32 == v)
+}
+
+/// The smallest process-ref class that holds a RAW frame of `w` x `h` (spec
+/// 6.3.22). The SDK sizes each ref's memory by it: about 1 GB of device memory
+/// for a develop ref at 8K (spec 9.2).
+fn resolution_for(w: u32, h: u32) -> Resolution {
+    const CLASSES: [(Resolution, u32, u32); 4] = [
+        (Resolution::K4, 4096, 2160),
+        (Resolution::K4_5, 4512, 2376),
+        (Resolution::K5_9, 5952, 3140),
+        (Resolution::K8, 8192, 4320),
+    ];
+    CLASSES.iter().find(|(_, cw, ch)| w <= *cw && h <= *ch).map_or(Resolution::K8, |c| c.0)
 }
 
 /// The decode level for a scale factor: 1, 2 or 4.
@@ -134,6 +156,7 @@ struct Clip {
     dev: DevParamV13,
     level: DecodeLevel,
     frame_count: u64,
+    resolution: Resolution,
 }
 
 impl Clip {
@@ -210,10 +233,10 @@ impl Split {
         // Process refs are leased, never released early: releasing one soon
         // after creating it can crash the Windows SDK.
         let decompress_ref = sdk
-            .lease_process_ref(clip.format_id, Device::Cpu, SdkGpu::NotUse, ProcessType::DECOMPRESS, Resolution::K8)
+            .lease_process_ref(clip.format_id, Device::Cpu, SdkGpu::NotUse, ProcessType::DECOMPRESS, clip.resolution)
             .map_err(|e| format!("decompress process ref: {e}"))?;
         let develop_ref = sdk
-            .lease_process_ref(clip.format_id, lane_device(clip.lane), gpu, ProcessType::DEVELOP, Resolution::K8)
+            .lease_process_ref(clip.format_id, lane_device(clip.lane), gpu, ProcessType::DEVELOP, clip.resolution)
             .map_err(|e| format!("develop process ref: {e}"))?;
         let mut s = Self {
             inflight: VecDeque::with_capacity(depth),
@@ -313,7 +336,7 @@ impl Split {
         out: &Output,
         frame: u64,
         dst: *mut c_void,
-        sync: &mut dyn FnMut(),
+        sync: &mut dyn FnMut() -> Result<(), String>,
         prefetch: bool,
     ) -> Result<(), String> {
         // Anything but this frame at the head is stale: a seek or a step back.
@@ -360,16 +383,16 @@ impl Split {
                     &hdr,
                 )
             };
-            if r.is_ok() {
-                sync();
+            match r {
+                Ok(_) => sync().map_err(|e| format!("developing frame {frame}: {e}")),
+                Err(e) => {
+                    let detail = clip.sdk.get_last_error_string().unwrap_or_default();
+                    Err(format!("developing frame {frame}: {e} {detail}").trim_end().to_string())
+                }
             }
-            r
         };
         self.free.push(bayer);
-        if let Err(e) = r {
-            let detail = clip.sdk.get_last_error_string().unwrap_or_default();
-            return Err(format!("developing frame {frame}: {e} {detail}").trim_end().to_string());
-        }
+        r?;
         if prefetch {
             let _ = self.fill(clip, movie, frame + 1);
         }
@@ -398,12 +421,26 @@ impl Reader {
         let (sdk, key) = sdk::current().ok_or("the Canon SDK is not initialised")?;
         let file = File::open(path).map_err(|e| format!("opening {}: {e}", path.display()))?;
         let mut movie = CrmContainer::load(file).map_err(|e| format!("not a readable CRM clip: {e}"))?;
-        let frame_count = movie.frame_count();
+        // Every frame is developed with its own timed metadata, so only frames
+        // that have it can be decoded; and a recording cut short (power loss, a
+        // copy that stopped) lists frames past the end of the file. Both are
+        // left out, so that the clip ends where its readable frames do.
+        let listed = movie.frame_count();
+        let with_meta = listed.min(movie.timed_meta_count());
+        let frame_count = with_meta.min(movie.readable_frame_count());
         if frame_count == 0 {
-            return Err("the clip has no video frames".into());
+            return Err(if listed == 0 {
+                "the clip has no video frames".into()
+            } else {
+                format!("none of the clip's {listed} frames can be read: the file is cut short or damaged")
+            });
         }
-        if movie.timed_meta_count() != frame_count {
-            return Err("the clip's timed metadata does not have one entry per video frame".into());
+        if frame_count < listed {
+            log::warn(&format!(
+                "{}: {frame_count} of the clip's {listed} frames can be read{}",
+                path.display(),
+                if with_meta < listed { " (timed metadata missing for the rest)" } else { "; the file is cut short" }
+            ));
         }
         let uuid_box: Arc<[u8]> =
             movie.canon_uuid_box().ok_or("the clip has no Canon metadata box")?.to_vec().into();
@@ -419,8 +456,9 @@ impl Reader {
 
         let (fps_num, fps_den) = frame_rate(&movie, &sdk, format_id, &probe_hdr);
         let bit_depth = sdk.get_image_info(format_id, &probe_hdr, image_info::BitDepth).map(u32::from).unwrap_or(0);
+        // kCrmLensSqueezeX13 desqueezes by 1.33, i.e. 4/3 (spec 6.3.17, 8.2.20).
         let pixel_aspect = match sdk.get_image_info(format_id, &probe_hdr, image_info::LensSqueezeFactor) {
-            Ok(1) => 1.3,
+            Ok(1) => 4.0 / 3.0,
             Ok(2) => 2.0,
             _ => 1.0,
         };
@@ -445,7 +483,7 @@ impl Reader {
             iso_setting: IsoSetting::Record,
             iso_speed: 0,
         };
-        let clip = Clip {
+        let mut clip = Clip {
             sdk: sdk.clone(),
             lane: key.lane,
             format_id,
@@ -456,19 +494,53 @@ impl Reader {
             dev,
             level: DecodeLevel::Full,
             frame_count,
+            resolution: Resolution::K8,
         };
         let full = clip.output_at(DecodeLevel::Full)?;
         let gpu = pick_gpu(&sdk, lane_device(key.lane));
+        clip.resolution = match params.resolution {
+            Some(r) => r,
+            None => {
+                // The RAW frame the refs hold: the decompressed Bayer raster,
+                // which is larger than the capture area.
+                let p = clip.res_param(DataType::CrmCompressed, DataType::CrmDecompressed, BufferType::Cpu, BufferType::Cpu);
+                let (bw, bh) = sdk.get_out_image_size(&p, &clip.probe_hdr).unwrap_or((u32::MAX, u32::MAX));
+                resolution_for(bw.max(cw), bh.max(ch))
+            }
+        };
 
         let depth = params.depth.min(MAX_DEPTH);
-        let pipe = match (depth > 0).then(|| Split::new(&clip, gpu, depth)) {
-            Some(Ok(s)) => Pipe::Split(Box::new(s)),
-            other => {
-                if let Some(Err(e)) = other {
-                    eprintln!("CRM: the read-ahead pipeline is unavailable ({e}); decoding one frame at a time");
+        let can_async = sdk.CrmGetImageAsync.is_some();
+        if depth > 0 && !can_async {
+            log::warn("this Canon SDK has no CrmGetImageAsync; decoding one frame at a time");
+        }
+        let mut pipe = None;
+        if depth > 0 && can_async {
+            match Split::new(&clip, gpu, depth) {
+                Ok(s) => pipe = Some(Pipe::Split(Box::new(s))),
+                Err(e) if clip.resolution != Resolution::K8 && params.resolution.is_none() => {
+                    // A smaller class than the SDK wants for this clip: fall back to the largest.
+                    log::warn(&format!("process refs at {:?} failed ({e}); using K8", clip.resolution));
+                    clip.resolution = Resolution::K8;
+                    match Split::new(&clip, gpu, depth) {
+                        Ok(s) => pipe = Some(Pipe::Split(Box::new(s))),
+                        Err(e) => log::warn(&format!("the read-ahead pipeline is unavailable ({e}); decoding one frame at a time")),
+                    }
                 }
-                Pipe::Combined(Box::new(combined(&clip, gpu, &meta0)?))
+                Err(e) => log::warn(&format!("the read-ahead pipeline is unavailable ({e}); decoding one frame at a time")),
             }
+        }
+        let pipe = match pipe {
+            Some(p) => p,
+            None => match combined(&clip, gpu, &meta0) {
+                Ok(c) => Pipe::Combined(Box::new(c)),
+                Err(e) if clip.resolution != Resolution::K8 && params.resolution.is_none() => {
+                    log::warn(&format!("a decode context at {:?} failed ({e}); using K8", clip.resolution));
+                    clip.resolution = Resolution::K8;
+                    Pipe::Combined(Box::new(combined(&clip, gpu, &meta0)?))
+                }
+                Err(e) => return Err(e),
+            },
         };
         let depth = if matches!(pipe, Pipe::Split(_)) { depth } else { 0 };
 
@@ -484,6 +556,7 @@ impl Reader {
             gamma: gamma as i32,
             color_space: color_space as i32,
             depth: depth as i32,
+            resolution: clip.resolution as i32,
         };
         Ok(Self { pipe, clip, movie, out: full, info, metadata })
     }
@@ -543,7 +616,7 @@ impl Reader {
         frame: u64,
         dst: *mut c_void,
         dst_size: u32,
-        sync: &mut dyn FnMut(),
+        sync: &mut dyn FnMut() -> Result<(), String>,
         prefetch: bool,
     ) -> Result<(), String> {
         if frame >= self.clip.frame_count {
@@ -569,8 +642,7 @@ impl Reader {
                     let detail = self.clip.sdk.get_last_error_string().unwrap_or_default();
                     format!("decoding frame {frame}: {e} {detail}").trim_end().to_string()
                 })?;
-                sync();
-                Ok(())
+                sync().map_err(|e| format!("decoding frame {frame}: {e}"))
             }
         }
     }
@@ -591,7 +663,7 @@ fn combined(clip: &Clip, gpu: SdkGpu, meta0: &[u8]) -> Result<DecodeContext, Str
         lane_device(clip.lane),
         gpu,
         ProcessType::DEVELOP | ProcessType::DECOMPRESS,
-        Resolution::K8,
+        clip.resolution,
         clip.dev,
         res,
         clip.uuid_box.to_vec(),
@@ -700,4 +772,22 @@ pub fn gamma_from(v: i32) -> Option<Gamma> {
 pub fn color_space_from(v: i32) -> Option<ColorSpace> {
     use ColorSpace::*;
     [Bt709, DciP3Plus, CinemaGamut, Bt2020, Aces, DciP3, Original].into_iter().find(|c| *c as u32 as i32 == v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolution_classes() {
+        assert_eq!(resolution_for(4096, 2160), Resolution::K4);
+        assert_eq!(resolution_for(4097, 2160), Resolution::K4_5);
+        assert_eq!(resolution_for(4512, 2376), Resolution::K4_5);
+        assert_eq!(resolution_for(5952, 3140), Resolution::K5_9);
+        assert_eq!(resolution_for(6000, 3164), Resolution::K8);
+        assert_eq!(resolution_for(8192, 4320), Resolution::K8);
+        assert_eq!(resolution_for(u32::MAX, u32::MAX), Resolution::K8);
+        assert_eq!(resolution_from(Resolution::K5_9 as i32), Some(Resolution::K5_9));
+        assert_eq!(resolution_from(0), None);
+    }
 }

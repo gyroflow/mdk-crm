@@ -15,10 +15,11 @@ publish = false
 crate-type = ["staticlib"]
 
 [dependencies]
-canon-raw = { git = "https://github.com/AdrianEddy/canon-raw" }
-crm-container = { git = "https://github.com/AdrianEddy/canon-raw" }
+# Pinned: a new canon-raw commit is taken on purpose, together with Cargo.lock.
+canon-raw = { git = "https://github.com/AdrianEddy/canon-raw", rev = "1eb3a19" }
+crm-container = { git = "https://github.com/AdrianEddy/canon-raw", rev = "1eb3a19" }
 libloading = "0.9"
-pollster = "0.4"
+pollster = "1"
 
 [profile.release]
 debug = 1

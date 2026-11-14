@@ -12,6 +12,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use canon_raw::CrmSdkLibrary;
 
+use crate::log;
+
 pub const LANE_CUDA: i32 = 1;
 pub const LANE_OPENCL: i32 = 2;
 pub const LANE_METAL: i32 = 3;
@@ -62,6 +64,13 @@ pub fn lane_name(lane: i32) -> &'static str {
     }
 }
 
+/// Why [`init`] failed: before the SDK was handed the GPU's stream or queue,
+/// or after, when the SDK may keep using them and they must outlive it.
+pub enum InitError {
+    BeforeBind(String),
+    AfterBind(String),
+}
+
 struct State {
     lib: Option<(Arc<CrmSdkLibrary>, PathBuf)>,
     key: Option<GpuKey>,
@@ -79,34 +88,45 @@ pub fn current() -> Option<(Arc<CrmSdkLibrary>, GpuKey)> {
     Some((s.lib.as_ref()?.0.clone(), s.key?))
 }
 
-pub fn init(search: &[PathBuf], luts_dir: Option<&Path>, gpu: &Gpu) -> Result<(), String> {
+/// Find and load the library, without binding any GPU. A failure is not
+/// remembered: the SDK may be installed while the application runs.
+pub fn load_library(search: &[PathBuf]) -> Result<(), String> {
+    let mut s = state();
+    if s.lib.is_none() {
+        let (lib, path) = load(search)?;
+        s.lib = Some((Arc::new(lib), path));
+    }
+    Ok(())
+}
+
+pub fn init(search: &[PathBuf], luts_dir: Option<&Path>, gpu: &Gpu) -> Result<(), InitError> {
     let key = gpu.key();
     if !matches!(key.lane, LANE_CUDA | LANE_OPENCL | LANE_METAL) {
-        return Err(format!("unknown GPU lane {}", gpu.lane));
+        return Err(InitError::BeforeBind(format!("unknown GPU lane {}", gpu.lane)));
     }
     let mut s = state();
     if let Some(bound) = s.key {
         if bound == key {
             return Ok(());
         }
-        return Err(format!(
+        return Err(InitError::BeforeBind(format!(
             "the Canon SDK is a process singleton and is already initialised for {} on another device or stream",
             lane_name(bound.lane)
-        ));
+        )));
     }
     if s.lib.is_none() {
-        let (lib, path) = load(search)?;
+        let (lib, path) = load(search).map_err(InitError::BeforeBind)?;
         s.lib = Some((Arc::new(lib), path));
     }
     let (lib, path) = s.lib.clone().expect("loaded above");
     // A no-op before the first init, and a clean slate after a failed one.
     // SAFETY: nothing has been created on the SDK: no regime is bound yet.
     let _ = unsafe { lib.terminate_sdk() };
-    init_lane(&lib, gpu)?;
+    init_lane(&lib, gpu).map_err(InitError::AfterBind)?;
     if let Err(e) = check_supported(&lib, gpu.lane) {
         // SAFETY: nothing was created on the regime that was just bound.
         let _ = unsafe { lib.terminate_sdk() };
-        return Err(e);
+        return Err(InitError::AfterBind(e));
     }
     apply_luts(&lib, &path, luts_dir);
     s.key = Some(key);
@@ -166,7 +186,7 @@ fn check_supported(lib: &CrmSdkLibrary, lane: i32) -> Result<(), String> {
         .iter()
         .map(|g| format!("{}{}", g.device_name(), if g.is_supported() { "" } else { " (unsupported)" }))
         .collect();
-    eprintln!("CRM: the Canon SDK sees on {}: {}", lane_name(lane), names.join(", "));
+    log::info(&format!("the Canon SDK sees on {}: {}", lane_name(lane), names.join(", ")));
     if list.is_empty() || list.iter().any(|g| g.is_supported()) {
         return Ok(());
     }
@@ -186,6 +206,10 @@ const LIB_NAME: &str = "CrmSdk.dll";
 const LIB_NAME: &str = "CrmSdk";
 #[cfg(not(any(target_os = "windows", target_vendor = "apple")))]
 const LIB_NAME: &str = "libCrmSdk.so";
+
+/// The SDK release whose structures (`*V13`) the bindings pass.
+const SDK_MAJOR: u8 = 2;
+const SDK_MINOR: u8 = 10;
 
 /// Where the library sits below a directory: beside the application, or in
 /// the SDK's own layout (`CRMSDK210/CRMSDK/...`).
@@ -216,7 +240,7 @@ fn find_library(search: &[PathBuf]) -> Result<PathBuf, String> {
             return Ok(p);
         }
     }
-    let tried: Vec<String> = search.iter().map(|p| p.display().to_string()).collect();
+    let tried: Vec<String> = search.iter().filter(|p| !p.as_os_str().is_empty()).map(|p| p.display().to_string()).collect();
     Err(format!("the Canon CRM SDK ({LIB_NAME}) was not found; searched: {}", tried.join(", ")))
 }
 
@@ -244,9 +268,13 @@ fn preload_siblings(dir: &Path) {
         if !p.is_file() {
             continue;
         }
+        // Local scope: the loader matches the SDK's DT_NEEDED entries (and its
+        // bare-name dlopen calls) against loaded objects by soname whatever
+        // their scope, and these 2017 Intel runtimes and the CUDA runtime must
+        // not interpose on copies other libraries of the process bring.
         #[cfg(unix)]
         let r = unsafe {
-            libloading::os::unix::Library::open(Some(&p), libloading::os::unix::RTLD_NOW | libloading::os::unix::RTLD_GLOBAL)
+            libloading::os::unix::Library::open(Some(&p), libloading::os::unix::RTLD_NOW | libloading::os::unix::RTLD_LOCAL)
         }
         .map(libloading::Library::from);
         #[cfg(windows)]
@@ -255,14 +283,73 @@ fn preload_siblings(dir: &Path) {
         match r {
             // Kept loaded for the life of the process, like the SDK itself.
             Ok(lib) => std::mem::forget(lib),
-            Err(e) => eprintln!("CRM: could not preload {}: {e}", p.display()),
+            Err(e) => log::warn(&format!("could not preload {}: {e}", p.display())),
         }
     }
 }
 
+/// `canonicalize` gives verbatim paths on Windows (`\\?\C:\...`,
+/// `\\?\UNC\server\share\...`), which the SDK cannot strip its own name from.
+/// The plain form of each; anything else as it is.
+#[cfg(target_os = "windows")]
+fn plain_path(p: PathBuf) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        let b = rest.as_bytes();
+        if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\' {
+            return PathBuf::from(rest);
+        }
+    }
+    p
+}
+
+/// Whether every character of `p` exists in the system's ANSI code page. The SDK opens its own files (its
+/// decompressing library, its resources) by paths in that code page, so from a directory with other characters its
+/// initialisation fails ("Failed to initialize the decompressing library").
+#[cfg(target_os = "windows")]
+fn in_ansi_code_page(p: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    unsafe extern "system" {
+        fn WideCharToMultiByte(
+            code_page: u32,
+            flags: u32,
+            wide: *const u16,
+            wide_len: i32,
+            out: *mut u8,
+            out_len: i32,
+            default_char: *const u8,
+            used_default_char: *mut i32,
+        ) -> i32;
+    }
+    const CP_ACP: u32 = 0;
+    const WC_NO_BEST_FIT_CHARS: u32 = 0x400;
+    let wide: Vec<u16> = p.as_os_str().encode_wide().collect();
+    if wide.is_empty() {
+        return true;
+    }
+    let mut used_default = 0i32;
+    // SAFETY: `wide` holds `wide.len()` units; no output buffer is given, only the length is asked for.
+    let n = unsafe {
+        WideCharToMultiByte(
+            CP_ACP,
+            WC_NO_BEST_FIT_CHARS,
+            wide.as_ptr(),
+            wide.len() as i32,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+            &mut used_default,
+        )
+    };
+    n > 0 && used_default == 0
+}
+
 fn load(search: &[PathBuf]) -> Result<(CrmSdkLibrary, PathBuf), String> {
-    let path = find_library(search)?;
-    let path = std::fs::canonicalize(&path).unwrap_or(path);
+    let found = find_library(search)?;
+    let path = std::fs::canonicalize(&found).unwrap_or_else(|_| found.clone());
     #[cfg(target_os = "windows")]
     if path.file_name().is_none_or(|n| n != LIB_NAME) {
         return Err(format!(
@@ -270,43 +357,147 @@ fn load(search: &[PathBuf]) -> Result<(CrmSdkLibrary, PathBuf), String> {
             path.display()
         ));
     }
-    // `canonicalize` gives a `\\?\` path on Windows, which the SDK cannot strip
-    // its own name from either; use the plain form.
     #[cfg(target_os = "windows")]
-    let path = PathBuf::from(path.to_string_lossy().trim_start_matches(r"\\?\"));
+    let path = plain_path(path);
+    #[cfg(target_os = "windows")]
+    if path.to_string_lossy().starts_with(r"\\?\") {
+        return Err(format!(
+            "{} cannot be used: the Canon SDK cannot load from a path this long; install it in a shorter folder",
+            path.display()
+        ));
+    }
+    #[cfg(target_os = "windows")]
+    if !in_ansi_code_page(&path) {
+        return Err(format!(
+            "{} cannot be used: the Canon SDK only works from a folder whose name has no characters outside this system's code page; install it in another folder",
+            path.display()
+        ));
+    }
     if let Some(dir) = path.parent() {
         preload_siblings(dir);
     }
     // SAFETY: the Canon CRM SDK library, located and name-checked above; loading
     // it runs its initialisers.
     let lib = unsafe { CrmSdkLibrary::load(&path) }.map_err(|e| format!("loading {} failed: {e}", path.display()))?;
+    match lib.get_sdk_info() {
+        Ok((v, _, _)) if v.major != SDK_MAJOR || v.minor < SDK_MINOR => {
+            return Err(format!(
+                "{} is Canon CRM SDK {}.{}; this plugin needs {SDK_MAJOR}.{SDK_MINOR} or a later {SDK_MAJOR}.x",
+                path.display(),
+                v.major,
+                v.minor
+            ));
+        }
+        Ok((v, _, _)) if v.minor != SDK_MINOR => {
+            log::warn(&format!(
+                "{} is Canon CRM SDK {}.{}; this plugin was made for {SDK_MAJOR}.{SDK_MINOR}",
+                path.display(),
+                v.major,
+                v.minor
+            ));
+        }
+        Ok(_) => {}
+        Err(e) => log::warn(&format!("could not read the version of {}: {e}", path.display())),
+    }
     Ok((lib, path))
 }
 
-/// Point the SDK at its colour LUTs. It loads `<library dir>/CanonLUTs` by
-/// itself at init; this finds them in the SDK's own layout too, where they sit
-/// a few levels above the library. `CrmSetLUTsDirectory` takes the directory
-/// that CONTAINS `CanonLUTs`, and reports success for one that does not, so
-/// the check is ours.
+/// Where `CanonLUTs` can be for the library at `lib_path`: beside it, beside
+/// the framework it is in, and the root of the SDK's own layout
+/// (`CRMSDK/CanonLUTs` above `Win_Lib/x64`, `Linux_Lib`, `Mac_Lib/x86_64`).
+/// Nowhere else, so that an unrelated folder further up is never taken.
+fn luts_candidates(lib_path: &Path) -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    let Some(dir) = lib_path.parent() else { return v };
+    v.push(dir.to_path_buf());
+    // .../CrmSdk.framework/Versions/A/CrmSdk or .../CrmSdk.framework/CrmSdk
+    let framework = lib_path.ancestors().find(|a| a.extension().is_some_and(|e| e == "framework"));
+    let lib_home = match framework {
+        Some(f) => {
+            let parent = f.parent().map(Path::to_path_buf);
+            v.extend(parent.clone());
+            parent
+        }
+        None => Some(dir.to_path_buf()),
+    };
+    if let Some(home) = lib_home {
+        let name = |p: &Path| p.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+        let parent = home.parent();
+        let grandparent = parent.and_then(Path::parent);
+        match (name(&home).as_str(), parent.map(name).as_deref()) {
+            ("x64", Some("win_lib")) | ("x86_64", Some("mac_lib")) => v.extend(grandparent.map(Path::to_path_buf)),
+            ("linux_lib", _) => v.extend(parent.map(Path::to_path_buf)),
+            _ => {}
+        }
+    }
+    v
+}
+
+/// Point the SDK at its colour LUTs. `CrmSetLUTsDirectory` takes the directory
+/// that CONTAINS `CanonLUTs`, and reports success for one that does not, so the
+/// check is ours. Every develop recipe uses them, the default Rec.709 one too,
+/// so a missing folder makes every frame fail.
 fn apply_luts(lib: &CrmSdkLibrary, lib_path: &Path, explicit: Option<&Path>) {
     const LUTS: &str = "CanonLUTs";
     let dir = match explicit {
         Some(d) => {
             if !d.join(LUTS).is_dir() {
-                eprintln!(
-                    "CRM: {} has no {LUTS} folder (pass the directory that contains it); HDR and colour-space conversions will fail",
+                log::warn(&format!(
+                    "{} has no {LUTS} folder (pass the directory that contains it); developing will fail",
                     d.display()
-                );
+                ));
             }
             Some(d.to_path_buf())
         }
-        // Up to the SDK root, from as deep as Mac_Lib/x86_64/CrmSdk.framework/Versions/A/CrmSdk.
-        None => lib_path.ancestors().skip(1).take(8).find(|d| d.join(LUTS).is_dir()).map(Path::to_path_buf),
-    };
-    if let Some(dir) = dir {
-        if let Err(e) = lib.set_luts_directory(&dir, true) {
-            eprintln!("CRM: setting the LUTs directory {} failed: {e}", dir.display());
+        None => {
+            let candidates = luts_candidates(lib_path);
+            let found = candidates.iter().find(|d| d.join(LUTS).is_dir()).cloned();
+            if found.is_none() {
+                let tried: Vec<String> = candidates.iter().map(|d| d.display().to_string()).collect();
+                log::warn(&format!(
+                    "no {LUTS} folder beside the Canon SDK (looked in {}); developing will fail. Set CRMSDK_LUTS_DIR to the directory that contains it",
+                    tried.join(", ")
+                ));
+            }
+            found
         }
+    };
+    if let Some(dir) = dir
+        && let Err(e) = lib.set_luts_directory(&dir, true)
+    {
+        log::warn(&format!("setting the LUTs directory {} failed: {e}", dir.display()));
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn plain_paths() {
+        assert_eq!(plain_path(PathBuf::from(r"\\?\C:\a\CrmSdk.dll")), PathBuf::from(r"C:\a\CrmSdk.dll"));
+        assert_eq!(plain_path(PathBuf::from(r"\\?\UNC\srv\share\b\CrmSdk.dll")), PathBuf::from(r"\\srv\share\b\CrmSdk.dll"));
+        assert_eq!(plain_path(PathBuf::from(r"C:\a\CrmSdk.dll")), PathBuf::from(r"C:\a\CrmSdk.dll"));
+        assert_eq!(plain_path(PathBuf::from(r"\\?\Volume{x}\a")), PathBuf::from(r"\\?\Volume{x}\a"));
+    }
+
+    #[test]
+    fn luts_places() {
+        let sdk = Path::new("/x/CRMSDK210/CRMSDK");
+        let c = luts_candidates(&sdk.join("Win_Lib/x64/CrmSdk.dll"));
+        assert_eq!(c, vec![sdk.join("Win_Lib/x64"), sdk.to_path_buf()]);
+        let c = luts_candidates(&sdk.join("Linux_Lib/libCrmSdk.so"));
+        assert_eq!(c, vec![sdk.join("Linux_Lib"), sdk.to_path_buf()]);
+        let c = luts_candidates(&sdk.join("Mac_Lib/x86_64/CrmSdk.framework/Versions/A/CrmSdk"));
+        assert_eq!(
+            c,
+            vec![sdk.join("Mac_Lib/x86_64/CrmSdk.framework/Versions/A"), sdk.join("Mac_Lib/x86_64"), sdk.to_path_buf()]
+        );
+        let app = Path::new("/Applications/Gyroflow.app/Contents/Frameworks");
+        let c = luts_candidates(&app.join("CrmSdk.framework/Versions/A/CrmSdk"));
+        assert_eq!(c, vec![app.join("CrmSdk.framework/Versions/A"), app.to_path_buf()]);
+        let c = luts_candidates(Path::new("/opt/gyroflow/lib/libCrmSdk.so"));
+        assert_eq!(c, vec![PathBuf::from("/opt/gyroflow/lib")]);
+    }
+}

@@ -20,11 +20,14 @@ class DynLib
 {
 public:
     // The first of `names` that loads. Never unloaded: the GPU objects made
-    // through it live as long as the process.
+    // through it live as long as the process. On Windows only from System32,
+    // where the drivers install these: a bare name would otherwise be looked
+    // for in the application's and the current directory first, where a
+    // machine without the driver could be handed a planted copy.
     bool open(std::initializer_list<const char*> names) {
         for (auto n : names) {
 #ifdef _WIN32
-            h_ = (void*)LoadLibraryA(n);
+            h_ = (void*)LoadLibraryExA(n, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
 #else
             h_ = dlopen(n, RTLD_NOW | RTLD_LOCAL);
 #endif

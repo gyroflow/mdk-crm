@@ -8,6 +8,7 @@
 #include "DynLib.h"
 #include <cstring>
 #include <iostream>
+#include <mutex>
 #include <string>
 
 MDK_NS_BEGIN
@@ -101,12 +102,17 @@ void exclusive(F&& f)
 /*
   The SDK forbids its CUDA calls from overlapping any other CUDA call of the
   process. MDK maps a CUDA frame for rendering with CUDA calls of its own, on
-  its render thread, so the mapping runs under the same exclusion.
+  its render thread, so the mapping runs under the same exclusion; and so does
+  releasing MDK's buffer, which frees what the mapping made and, for the last
+  frame of a pool, the pool's stream, pinned memory and context.
  */
 class ExclusiveBuffer final : public NativeVideoBuffer
 {
 public:
     explicit ExclusiveBuffer(NativeVideoBufferRef b) : b_(std::move(b)) {}
+    ~ExclusiveBuffer() override {
+        exclusive([&] { b_.reset(); });
+    }
     void* map(Type type, MapParameter* mp) override {
         void* r = nullptr;
         exclusive([&] { r = b_->map(type, mp); });
@@ -157,7 +163,8 @@ public:
             return false;
         }
         // The primary context: the one the SDK's CUDA runtime uses on this
-        // device, and the one MDK shares.
+        // device. MDK's CUDA pools make contexts of their own (they want other
+        // flags than the primary context has) and copy frames across.
         if ((r = api_.primaryCtxRetain(&ctx_, dev_)) != 0) {
             *err = "cuDevicePrimaryCtxRetain: " + api_.error(r);
             return false;
@@ -209,14 +216,21 @@ public:
             api_.ctxPop(&old);
         });
     }
-    void sync() override {
-        api_.ctxPush(ctx_);
-        api_.streamSynchronize(stream_);
+    int sync() override {
+        CUresult r = api_.ctxPush(ctx_);
+        if (r != 0) {
+            std::clog << "CRM: cuCtxPushCurrent: " << api_.error(r) << std::endl;
+            return r;
+        }
+        r = api_.streamSynchronize(stream_);
+        if (r != 0)
+            std::clog << "CRM: cuStreamSynchronize: " << api_.error(r) << std::endl;
         CUcontext old = nullptr;
         api_.ctxPop(&old);
+        return r;
     }
     VideoFrame frame(void* buf, const crmc_output& out, bool copy, NativeVideoBufferPool::Ptr* pool,
-                     std::function<void()> recycle) override {
+                     std::function<void()> recycle, std::string* err) override {
         if (copy || !pool || !*pool) {
             VideoFrame f((int)out.width, (int)out.height, PixelFormat::RGBA64LE);
             int strides[4] = {(int)out.bytes_per_line};
@@ -232,14 +246,15 @@ public:
             c.Height = out.height;
             CUresult r = 0;
             exclusive([&] {
-                api_.ctxPush(ctx_);
+                if ((r = api_.ctxPush(ctx_)) != 0)
+                    return;
                 r = api_.memcpy2D(&c);
                 CUcontext old = nullptr;
                 api_.ctxPop(&old);
             });
             recycle();
             if (r != 0) {
-                std::clog << "CRM: cuMemcpy2D: " << api_.error(r) << std::endl;
+                *err = "copying the frame to host memory: " + api_.error(r);
                 return VideoFrame();
             }
             return f;
@@ -252,10 +267,21 @@ public:
         res.format = PixelFormat::RGBA64LE;
         res.context = ctx_;
         res.stream = stream_;
-        res.unref = std::move(recycle);
-        auto f = VideoFrame::from(pool, res);
-        if (auto nb = f.nativeBuffer())
-            f.setNativeBuffer(std::make_shared<ExclusiveBuffer>(nb));
+        // Once only: MDK calls it when it lets go of the frame, and this
+        // function when MDK does not take the frame at all.
+        auto once = std::make_shared<std::once_flag>();
+        auto release = [once, recycle = std::move(recycle)] { std::call_once(*once, recycle); };
+        res.unref = release;
+        VideoFrame f;
+        // Creating MDK's buffer may make its pool's context and stream.
+        exclusive([&] { f = VideoFrame::from(pool, res); });
+        auto nb = f.nativeBuffer();
+        if (!nb) {
+            release();
+            *err = "MDK could not take the frame's CUDA memory";
+            return VideoFrame();
+        }
+        f.setNativeBuffer(std::make_shared<ExclusiveBuffer>(std::move(nb)));
         return f;
     }
 

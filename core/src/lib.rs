@@ -15,12 +15,50 @@ mod sdk;
 
 use reader::{Info, OpenParams, Output, Reader};
 
+/// Diagnostics, through the plugin's logger when it has set one (`crmc_set_log`).
+pub(crate) mod log {
+    use std::ffi::{CString, c_char};
+    use std::sync::atomic::{AtomicPtr, Ordering};
+
+    pub type LogFn = unsafe extern "C" fn(level: i32, msg: *const c_char);
+    static LOGGER: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
+
+    // 1 is an error; the core reports errors through its return values instead.
+    pub const WARNING: i32 = 2;
+    pub const INFO: i32 = 3;
+
+    pub fn set(f: Option<LogFn>) {
+        LOGGER.store(f.map_or(std::ptr::null_mut(), |f| f as *mut ()), Ordering::Release);
+    }
+
+    fn write(level: i32, msg: &str) {
+        let p = LOGGER.load(Ordering::Acquire);
+        if p.is_null() {
+            eprintln!("CRM: {msg}");
+            return;
+        }
+        // SAFETY: only `set` stores here, and it stores a `LogFn`.
+        let f: LogFn = unsafe { std::mem::transmute::<*mut (), LogFn>(p) };
+        let s = CString::new(msg.replace('\0', " ")).unwrap_or_default();
+        // SAFETY: the plugin's callback, given a NUL-terminated string valid for the call.
+        unsafe { f(level, s.as_ptr()) }
+    }
+
+    pub fn warn(msg: &str) {
+        write(WARNING, msg)
+    }
+    pub fn info(msg: &str) {
+        write(INFO, msg)
+    }
+}
+
 /// `crmc_open_params`.
 #[repr(C)]
 pub struct CrmcOpenParams {
     pub gamma: i32,
     pub color_space: i32,
     pub depth: i32,
+    pub resolution: i32,
 }
 
 /// `crmc_info`.
@@ -36,6 +74,7 @@ pub struct CrmcInfo {
     pub gamma: i32,
     pub color_space: i32,
     pub depth: i32,
+    pub resolution: i32,
 }
 
 impl From<Info> for CrmcInfo {
@@ -51,6 +90,7 @@ impl From<Info> for CrmcInfo {
             gamma: i.gamma,
             color_space: i.color_space,
             depth: i.depth,
+            resolution: i.resolution,
         }
     }
 }
@@ -139,6 +179,45 @@ unsafe fn path_arg(s: *const c_char) -> Option<PathBuf> {
 }
 
 /// # Safety
+/// `search` holds `n_search` entries, each null or a NUL-terminated string.
+unsafe fn search_args(search: *const *const c_char, n_search: usize) -> Vec<PathBuf> {
+    let mut dirs = Vec::with_capacity(n_search);
+    if search.is_null() {
+        return dirs;
+    }
+    for i in 0..n_search {
+        // SAFETY: per the contract.
+        if let Some(p) = unsafe { path_arg(*search.add(i)) } {
+            dirs.push(p);
+        }
+    }
+    dirs
+}
+
+/// # Safety
+/// `f` is null or a function callable from any thread for the life of the process.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn crmc_set_log(f: Option<log::LogFn>) {
+    log::set(f);
+}
+
+/// # Safety
+/// See `crm_core.h`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn crmc_sdk_load(
+    search: *const *const c_char,
+    n_search: usize,
+    err: *mut c_char,
+    err_len: usize,
+) -> i32 {
+    guarded(err, err_len, -1, || {
+        let dirs = unsafe { search_args(search, n_search) };
+        sdk::load_library(&dirs)?;
+        Ok(0)
+    })
+}
+
+/// # Safety
 /// See `crm_core.h`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn crmc_sdk_init(
@@ -149,19 +228,22 @@ pub unsafe extern "C" fn crmc_sdk_init(
     err: *mut c_char,
     err_len: usize,
 ) -> i32 {
-    guarded(err, err_len, -1, || {
+    // -1: failed before the SDK was handed the GPU; -2: after (see crm_core.h).
+    let mut code = -1;
+    let r = guarded(err, err_len, -1, || {
         let gpu = unsafe { gpu.as_ref() }.ok_or("no GPU given")?;
-        let mut dirs = Vec::with_capacity(n_search);
-        for i in 0..n_search {
-            // SAFETY: `search` holds `n_search` entries, each null or a string.
-            if let Some(p) = unsafe { path_arg(*search.add(i)) } {
-                dirs.push(p);
+        let dirs = unsafe { search_args(search, n_search) };
+        let luts = unsafe { path_arg(luts_dir) };
+        match sdk::init(&dirs, luts.as_deref(), gpu) {
+            Ok(()) => Ok(0),
+            Err(sdk::InitError::BeforeBind(e)) => Err(e),
+            Err(sdk::InitError::AfterBind(e)) => {
+                code = -2;
+                Err(e)
             }
         }
-        let luts = unsafe { path_arg(luts_dir) };
-        sdk::init(&dirs, luts.as_deref(), gpu)?;
-        Ok(0)
-    })
+    });
+    if r == 0 { 0 } else { code }
 }
 
 /// # Safety
@@ -185,7 +267,11 @@ pub unsafe extern "C" fn crmc_open(
             v => Some(reader::color_space_from(v).ok_or_else(|| format!("unknown colour space {v}"))?),
         };
         let depth = p.map_or(reader::MAX_DEPTH as i32, |p| p.depth).max(0) as usize;
-        let r = Reader::open(Path::new(&path), &OpenParams { gamma, color_space, depth })?;
+        let resolution = match p.map_or(0, |p| p.resolution) {
+            0 => None,
+            v => Some(reader::resolution_from(v).ok_or_else(|| format!("unknown resolution class {v}"))?),
+        };
+        let r = Reader::open(Path::new(&path), &OpenParams { gamma, color_space, depth, resolution })?;
         let handle =
             CrmcReader { info: r.info(), metadata: r.metadata().to_vec(), reader: Mutex::new(r) };
         Ok(Box::into_raw(Box::new(handle)))
@@ -292,7 +378,7 @@ pub unsafe extern "C" fn crmc_decode(
     frame: u64,
     dst: *mut c_void,
     dst_size: u32,
-    sync: Option<unsafe extern "C" fn(*mut c_void)>,
+    sync: Option<unsafe extern "C" fn(*mut c_void) -> i32>,
     user: *mut c_void,
     prefetch: i32,
     err: *mut c_char,
@@ -300,10 +386,12 @@ pub unsafe extern "C" fn crmc_decode(
 ) -> i32 {
     guarded(err, err_len, -1, || {
         let r = unsafe { r.as_ref() }.ok_or("no reader")?;
-        let mut sync = || {
-            if let Some(f) = sync {
-                // SAFETY: the caller's callback and its own argument.
-                unsafe { f(user) }
+        let mut sync = || -> Result<(), String> {
+            let Some(f) = sync else { return Ok(()) };
+            // SAFETY: the caller's callback and its own argument.
+            match unsafe { f(user) } {
+                0 => Ok(()),
+                e => Err(format!("the GPU did not finish the work (error {e})")),
             }
         };
         r.lock().decode(frame, dst, dst_size, &mut sync, prefetch != 0)?;

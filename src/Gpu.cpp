@@ -31,6 +31,13 @@ const char* GpuLaneName(int lane)
     }
 }
 
+#if !(__APPLE__ + 0)
+void RunInAutoreleasePool(const std::function<void()>& f)
+{
+    f();
+}
+#endif
+
 std::shared_ptr<Gpu> CreateGpu(int lane, const std::string& device, std::string* err)
 {
     switch (lane) {

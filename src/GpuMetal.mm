@@ -107,15 +107,29 @@ public:
         }
     }
     // A command buffer committed behind the SDK's work completes after it.
-    void sync() override {
+    int sync() override {
         @autoreleasepool {
             id<MTLCommandBuffer> cb = [queue_ commandBuffer];
+            if (!cb) {
+                std::clog << "CRM: Metal: no command buffer to wait with" << std::endl;
+                return -1;
+            }
             [cb commit];
             [cb waitUntilCompleted];
+            if (cb.status == MTLCommandBufferStatusError) {
+                std::clog << "CRM: Metal: " << (cb.error ? cb.error.localizedDescription.UTF8String : "the GPU failed")
+                          << std::endl;
+                return cb.error && cb.error.code ? (int)cb.error.code : -1;
+            }
+            return 0;
         }
     }
+    // MDK samples the SDK's buffer itself through a texture over it (zero-copy),
+    // on its own queue, so a released buffer waits for two newer frames before
+    // the SDK writes into it again.
+    size_t reuseDelay() const override { return unified_ ? 2 : 0; }
     VideoFrame frame(void* buf, const crmc_output& out, bool copy, NativeVideoBufferPool::Ptr*,
-                     std::function<void()> recycle) override {
+                     std::function<void()> recycle, std::string* err) override {
         @autoreleasepool {
             id<MTLBuffer> b = (__bridge id<MTLBuffer>)buf;
             if (copy) {
@@ -143,7 +157,12 @@ public:
             if (!tex) {
                 desc.storageMode = MTLStorageModePrivate;
                 tex = [dev_ newTextureWithDescriptor:desc];
-                id<MTLCommandBuffer> cb = [blitQueue_ commandBuffer];
+                id<MTLCommandBuffer> cb = tex ? [blitQueue_ commandBuffer] : nil;
+                if (!cb) {
+                    recycle();
+                    *err = "allocating a " + std::to_string(out.width) + "x" + std::to_string(out.height) + " Metal texture failed";
+                    return VideoFrame();
+                }
                 id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
                 [blit copyFromBuffer:b
                          sourceOffset:0
@@ -157,6 +176,12 @@ public:
                 [blit endEncoding];
                 [cb commit];
                 [cb waitUntilCompleted];
+                if (cb.status == MTLCommandBufferStatusError) {
+                    recycle();
+                    *err = std::string("copying the frame into a texture failed: ")
+                        + (cb.error ? cb.error.localizedDescription.UTF8String : "the GPU failed");
+                    return VideoFrame();
+                }
             }
             auto nb = std::make_shared<MetalFrameBuffer>(b, tex, out, std::move(recycle));
             return VideoFrame((int)out.width, (int)out.height, PixelFormat::RGBA64LE, nb);
@@ -172,6 +197,13 @@ private:
 };
 
 } // namespace
+
+void RunInAutoreleasePool(const std::function<void()>& f)
+{
+    @autoreleasepool {
+        f();
+    }
+}
 
 std::shared_ptr<Gpu> CreateMetalGpu(const std::string& device, std::string* err)
 {

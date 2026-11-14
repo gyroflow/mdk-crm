@@ -146,9 +146,14 @@ public:
         if (buf)
             api_.releaseMemObject((cl_mem)buf);
     }
-    void sync() override { api_.finish(queue_); }
+    int sync() override {
+        const cl_int r = api_.finish(queue_);
+        if (r != 0)
+            std::clog << "CRM: clFinish: " << r << std::endl;
+        return r;
+    }
     VideoFrame frame(void* buf, const crmc_output& out, bool, NativeVideoBufferPool::Ptr*,
-                     std::function<void()> recycle) override {
+                     std::function<void()> recycle, std::string* err) override {
         VideoFrame f((int)out.width, (int)out.height, PixelFormat::RGBA64LE);
         int strides[4] = {(int)out.bytes_per_line};
         f.setBuffers(nullptr, strides);
@@ -165,7 +170,7 @@ public:
         }
         recycle();
         if (r != 0) {
-            std::clog << "CRM: clEnqueueReadBuffer: " << r << std::endl;
+            *err = "reading the frame back from the GPU: clEnqueueReadBuffer " + std::to_string(r);
             return VideoFrame();
         }
         return f;
