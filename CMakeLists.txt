@@ -120,7 +120,27 @@ add_dependencies(${PROJECT_NAME} mdk_crm_core)
 target_link_libraries(${PROJECT_NAME} PRIVATE ${CORE_LIB} Threads::Threads)
 # What the Rust standard library and the core's crates link (`cargo rustc -- --print native-static-libs`).
 if(WIN32)
-  target_link_libraries(${PROJECT_NAME} PRIVATE ntdll userenv ws2_32 dbghelp)
+  # The standard library's part of that list changes between Rust releases (1.100 added synchronization.lib),
+  # so the toolchain that builds the core is asked for it: an empty staticlib names it.
+  set(RUST_STD_LIBS ntdll userenv ws2_32 dbghelp synchronization) # as of Rust 1.100, if rustc can't be asked
+  get_filename_component(CARGO_BIN_DIR "${CARGO}" DIRECTORY)
+  find_program(RUSTC rustc HINTS "${CARGO_BIN_DIR}")
+  if(RUSTC)
+    set(RUST_PROBE_DIR "${CMAKE_BINARY_DIR}/rust-std-libs")
+    file(WRITE "${RUST_PROBE_DIR}/empty.rs" "")
+    execute_process(
+      COMMAND ${RUSTC} --crate-type staticlib --print native-static-libs --out-dir "${RUST_PROBE_DIR}" "${RUST_PROBE_DIR}/empty.rs"
+      WORKING_DIRECTORY "${CORE_DIR}" # the toolchain cargo uses there
+      OUTPUT_VARIABLE RUST_PROBE_OUTPUT ERROR_VARIABLE RUST_PROBE_OUTPUT RESULT_VARIABLE RUST_PROBE_RESULT)
+    if(RUST_PROBE_RESULT EQUAL 0 AND RUST_PROBE_OUTPUT MATCHES "native-static-libs: ([^\r\n]+)")
+      separate_arguments(RUST_STD_LIBS WINDOWS_COMMAND "${CMAKE_MATCH_1}")
+      list(FILTER RUST_STD_LIBS EXCLUDE REGEX "^[/-]") # /defaultlib:msvcrt: the C++ objects name their runtime
+    else()
+      message(WARNING "rustc did not name the libraries its standard library links; using ${RUST_STD_LIBS}")
+    endif()
+  endif()
+  message(STATUS "The Rust standard library links: ${RUST_STD_LIBS}")
+  target_link_libraries(${PROJECT_NAME} PRIVATE ${RUST_STD_LIBS})
 elseif(APPLE)
   target_link_libraries(${PROJECT_NAME} PRIVATE "-framework Metal" "-framework Foundation" "-framework CoreFoundation" iconv)
 else()
